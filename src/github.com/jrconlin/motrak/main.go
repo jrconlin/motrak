@@ -46,6 +46,7 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGHUP, syscall.SIGUSR1)
 
 	Mux.Handle("/ws", websocket.Handler(handlers.WSHandler))
+    Mux.HandleFunc("/u", handlers.Update)
 	Mux.HandleFunc("/", handlers.Index)
 
 	log.Printf("main: starting up %s:%s\n", host, port)

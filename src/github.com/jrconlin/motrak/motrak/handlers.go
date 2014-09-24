@@ -4,6 +4,8 @@ import (
 	"code.google.com/p/go.net/websocket"
 	"github.com/jrconlin/motrak/util"
 
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
@@ -15,9 +17,43 @@ var (
 	Clients *ClientBox
 )
 
+func init() {
+    Clients = &ClientBox{
+        clients: make(map[string]WWS),
+    }
+}
+
+
 type ClientBox struct {
 	sync.RWMutex
-	clients map[string]WWS
+    clients map[string]WWS
+}
+
+func (r *ClientBox) Add(key string, ws WWS) {
+	defer r.Unlock()
+	r.Lock()
+	r.clients[key] = ws
+}
+
+func (r *ClientBox) Get(key string) WWS {
+	defer r.Unlock()
+	r.Lock()
+	return r.clients[key]
+}
+
+func (r *ClientBox) Del(key string) {
+	defer r.Unlock()
+	r.Lock()
+	delete(r.clients, key)
+}
+
+func (r *ClientBox) Send(value []byte) {
+    defer r.Unlock()
+    r.Lock()
+    for _,ch := range r.clients {
+        log.Printf("Sending to %+v\n", ch.(*WWSs).name)
+        ch.(*WWSs).output<-value
+    }
 }
 
 type Handler struct {
@@ -35,21 +71,44 @@ func (r *Handler) Index(resp http.ResponseWriter, req *http.Request) {
 	resp.Write([]byte("Index"))
 }
 
-// == socket
-type Sock interface {
-	Close() error
-	Write([]byte) (int, error)
+func (r *Handler) WSHandler(ws *websocket.Conn) {
+    rnd := make([]byte, 4)
+	rand.Read(rnd)
+    name := hex.EncodeToString(rnd)
+
+	sock := &WWSs{
+		handler: r,
+		name:    name,
+        output: make(chan []byte),
+	}
+    Clients.Add(name, sock)
+	sock.Run(ws)
 }
 
+type Upd struct {
+    Message []byte `json:"message"`
+}
+
+
+func (r *Handler) Update(resp http.ResponseWriter, req *http.Request) {
+    defer req.Body.Close()
+    buf := make([]byte,100)
+    req.Body.Read(buf)
+    log.Printf("%s", buf)
+    Clients.Send(buf)
+}
+
+
+// == socket
 type WWS interface {
-	Run()
+	Run(*websocket.Conn)
 	Close() error
-	Socket() Sock
 }
 
 type WWSs struct {
-	socket  Sock
+	socket  *websocket.Conn
 	handler *Handler
+	name    string
 	input   chan []byte
 	quitter chan struct{}
 	output  chan []byte
@@ -66,7 +125,7 @@ func (r *WWSs) sniffer() (err error) {
 	}()
 
 	for {
-		err = websocket.Message.Receive(r.socket.(*websocket.Conn), &raw)
+		err = websocket.Message.Receive(r.socket, &raw)
 		if err != nil {
 			switch {
 			case err == io.EOF:
@@ -84,23 +143,18 @@ func (r *WWSs) sniffer() (err error) {
 	}
 }
 
-func (r *WWSs) Close() error {
+func (r WWSs) Close() error {
 	close(r.quitter)
 	return nil
 }
 
-func (r *WWSs) Socket() Sock {
-	return r.socket
-}
-
-func (r *WWSs) Handler() *Handler {
+func (r WWSs) Handler() *Handler {
 	return r.handler
 }
 
-func (r *WWSs) Run() {
+func (r WWSs) Run(sock *websocket.Conn) {
 	r.input = make(chan []byte)
 	r.quitter = make(chan struct{})
-	r.output = make(chan []byte)
 
 	defer func(sock WWS) {
 		if rr := recover(); rr != nil {
@@ -117,6 +171,7 @@ func (r *WWSs) Run() {
 		}
 		return
 	}(r)
+    r.socket = sock
 
 	go r.sniffer()
 	for {
@@ -124,6 +179,7 @@ func (r *WWSs) Run() {
 		case <-r.quitter:
 			r.socket.Close()
 			close(r.input)
+			Clients.Del(r.name)
 			r.quitter = nil
 			return
 		case input := <-r.input:
@@ -141,9 +197,4 @@ func (r *WWSs) Run() {
 	}
 }
 
-func (r *Handler) WSHandler(ws *websocket.Conn) {
-	sock := &WWSs{
-		handler: r,
-	}
-	sock.Run()
-}
+
